@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "grandstream doctor",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "grandstream.commands.app",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "envFile": "${workspaceFolder}/.env",
+      "args": ["doctor"]
+    },
+    {
+      "name": "grandstream echo",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "grandstream.commands.app",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "envFile": "${workspaceFolder}/.env",
+      "args": ["audio", "echo"]
+    }
+  ]
+}

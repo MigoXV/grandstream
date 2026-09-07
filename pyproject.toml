@@ -1,0 +1,45 @@
+[project]
+name = "grandstream"
+version = "0.1.0"
+description = "HT813 provisioning、Asterisk ARI 与异步双向 PCM 语音流 SDK"
+authors = [
+    {name = "Grandstream SDK Maintainers",email = "grandstream-sdk@example.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "typer>=0.15.1,<1", "httpx>=0.28,<1", "websockets>=15,<16",
+    "pydantic>=2.10,<3", "numpy>=2,<2.3", "soxr>=1,<2",
+]
+
+[project.optional-dependencies]
+provisioning = ["starlette>=0.47,<1", "uvicorn>=0.34,<1"]
+
+[dependency-groups]
+dev = ["pytest>=8,<9", "pytest-asyncio>=1,<2", "ruff>=0.11,<1"]
+
+[tool.poetry]
+packages = [{include = "grandstream", from = "src"}]
+
+[tool.poetry.scripts]
+grandstream = "grandstream.commands.app:app"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[[tool.poetry.source]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+priority = "primary"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
