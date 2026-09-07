@@ -15,7 +15,7 @@ from .models import (
 from .provisioning import ProvisioningStore
 from .sip import AsteriskConfig, render_asterisk
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 __all__ = [
     "HT813",
     "AriApplication",

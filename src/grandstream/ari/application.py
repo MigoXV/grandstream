@@ -55,6 +55,9 @@ class AriApplication:
         self._ready = asyncio.Event()
         self._stopping = False
         self.connected = False
+        self.error: GrandstreamError | None = None
+        self._connection_handlers: list[Callable[[bool, GrandstreamError | None], None]] = []
+        self._caller_handlers: list[Callable[[Call], None]] = []
 
     @property
     def calls(self) -> tuple[Call, ...]:
@@ -81,6 +84,28 @@ class AriApplication:
             return handler
 
         return register(function) if function else register
+
+    def connection_changed(self, handler: Callable[[bool, GrandstreamError | None], None]):
+        """Register a synchronous, nonblocking connection status observer."""
+        self._connection_handlers.append(handler)
+        return handler
+
+    def caller_changed(self, handler: Callable[[Call], None]):
+        """Register a synchronous observer of an existing call's changed number."""
+        self._caller_handlers.append(handler)
+        return handler
+
+    @staticmethod
+    def _notify(handlers, *args):
+        for handler in handlers:
+            try:
+                handler(*args)
+            except Exception:
+                logger.warning("SDK 状态通知回调失败", exc_info=True)
+
+    def _connection(self, connected, error=None):
+        self.connected, self.error = connected, error
+        self._notify(self._connection_handlers, connected, error)
 
     def dtmf(self, digit: str):
         if not re.fullmatch(r"[0-9A-D*#]", digit):
@@ -145,7 +170,10 @@ class AriApplication:
                 call._spawn(call.hangup())
         elif call:
             if kind in {"ChannelCallerId", "ChannelStateChange"}:
+                previous = call.caller
                 call.update(channel)
+                if call.caller != previous:
+                    self._notify(self._caller_handlers, call)
             elif kind == "ChannelDtmfReceived" and event.get("digit") in self._dtmf:
                 if len(call._tasks) >= 32:
                     call.error = GrandstreamError("DTMF 处理器积压超过容量")
@@ -154,16 +182,19 @@ class AriApplication:
                     call._spawn(self._handle(call, self._dtmf[event["digit"]]))
             elif kind in {"StasisEnd", "ChannelDestroyed"}:
                 if call.outbound and not call._entered.is_set():
-                    call.error = DialFailed(f"外呼失败，挂机原因 {event.get('cause', 'unknown')}")
+                    call.error = DialFailed(
+                        f"外呼失败，挂机原因 {event.get('cause', 'unknown')}", cause=event.get("cause")
+                    )
                 call._spawn(call.hangup())
 
     async def _listen(self):
         delay = 1
         while not self._stopping:
             socket = None
+            error = None
             try:
                 socket = await self.ari.events(self.name)
-                self.connected = True
+                self._connection(True)
                 self._ready.set()
                 delay = 1
                 async for raw in socket:
@@ -173,27 +204,32 @@ class AriApplication:
                         self._stopping = True
                         raise ConnectionLost("ARI 应用被另一个客户端接管")
                     await self._dispatch(event)
+                error = ConnectionLost("ARI 事件连接已断开")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                error = exc if isinstance(exc, GrandstreamError) else ConnectionLost("ARI 事件连接失败")
                 logger.warning("ARI 事件连接中断 error=%s", type(exc).__name__)
             finally:
-                self.connected = False
+                self._connection(False, error)
                 self._ready.clear()
                 if socket:
                     await socket.close()
-                for call in self.calls:
-                    call.error = call.error or ConnectionLost("ARI 事件连接已断开")
+                if error is not None:
+                    for call in self.calls:
+                        call.error = call.error or error
                 await asyncio.gather(*(call.hangup() for call in self.calls), return_exceptions=True)
             if not self._stopping:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
 
-    async def start(self):
+    async def start(self, *, wait_connected: bool = True):
         if self._stopping:
             raise ConnectionLost("应用已关闭；请创建新的 AriApplication")
         if self._listener is None:
             self._listener = asyncio.create_task(self._listen(), name="grandstream-ari-events")
+        if not wait_connected:
+            return
         try:
             await asyncio.wait_for(self._ready.wait(), self.ari.config.timeout)
         except BaseException:
@@ -220,7 +256,7 @@ class AriApplication:
         elif number is not None:
             raise ValueError("呼叫 FXS 电话不需要 number")
         if any(call.port is port and not call.closed for call in self.calls):
-            raise DialFailed("端口正被通话占用")
+            raise DialFailed("端口正被通话占用", reason="busy")
         cid = "gs-call-" + uuid.uuid4().hex
         call = Call(self, {"id": cid, "state": "Down"}, endpoint=endpoint, outbound=True)
         self._calls[cid] = call

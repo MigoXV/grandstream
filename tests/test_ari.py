@@ -116,8 +116,10 @@ async def test_outbound_failure_before_stasis(runtime, cause):
             )
 
     ari.hook = hook
-    with pytest.raises(DialFailed, match=str(cause)):
+    with pytest.raises(DialFailed, match=str(cause)) as error:
         await app.dial(device.fxo, number="123")
+    assert error.value.cause == cause
+    assert error.value.reason == {17: "busy", 18: "no_answer"}.get(cause, "failed")
     assert not app.calls
 
 
@@ -234,3 +236,88 @@ async def test_rest_path_and_credentials_not_in_error():
 def test_configuration_rejects_credentials_in_url():
     with pytest.raises(ValueError):
         AriConfig(url="http://user:secret@host/ari", username="test", password="secret")
+
+
+async def test_public_status_and_caller_observers(runtime):
+    app, ari, _ = runtime
+    numbers, statuses = [], []
+    app.caller_changed(lambda call: numbers.append((call.id, call.caller)))
+    app.connection_changed(lambda connected, error: statuses.append((connected, error)))
+
+    @app.incoming_call
+    async def handler(call):
+        await asyncio.Event().wait()
+
+    call = await incoming_call(app)
+    event = {"type": "ChannelCallerId", "channel": {"id": call.id, "caller": {"number": "456"}}}
+    await app._dispatch(event)
+    await app._dispatch(event)
+    assert numbers == [(call.id, "456")]
+    await ari.events_socket.close()
+    await eventually(lambda: statuses)
+    assert statuses[0][0] is False and isinstance(statuses[0][1], ConnectionLost)
+    assert app.error is statuses[0][1]
+
+
+async def test_background_start_retries_initial_failure(monkeypatch):
+    ari = FakeAri()
+    app = AriApplication("retry-test", ari=ari)
+    statuses = []
+    app.connection_changed(lambda connected, error: statuses.append((connected, error)))
+    attempts = 0
+
+    async def events(name):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("private connection data")
+        return ari.events_socket
+
+    monkeypatch.setattr(ari, "events", events)
+    try:
+        await app.start(wait_connected=False)
+        await eventually(lambda: len(statuses) >= 2, timeout=2)
+        assert statuses[0][0] is False and isinstance(statuses[0][1], ConnectionLost)
+        assert statuses[1] == (True, None)
+        assert app.connected and app.error is None
+    finally:
+        await app.close()
+
+
+async def test_observer_failure_does_not_interrupt_other_observers(runtime):
+    app, _, _ = runtime
+    received = []
+
+    def fail(*args):
+        raise ValueError("observer error")
+
+    app.connection_changed(fail)
+    app.connection_changed(lambda *args: received.append(args))
+    await app.close()
+    assert received == [(False, None)]
+
+
+async def test_normal_shutdown_preserves_clean_call_status(runtime):
+    app, _, _ = runtime
+    finished = asyncio.Event()
+
+    @app.incoming_call
+    async def handler(call):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            # Business cleanup may await local work without hanging up again.
+            await asyncio.sleep(0)
+            finished.set()
+
+    call = await incoming_call(app)
+    await asyncio.sleep(0)
+    await asyncio.wait_for(app.close(), 1)
+    assert finished.is_set() and call.closed and call.error is None
+
+
+@pytest.mark.parametrize("cause,reason", [(17, "busy"), (18, "no_answer"), (19, "no_answer"), (34, "failed")])
+def test_dial_failure_has_structured_reason(cause, reason):
+    error = DialFailed("外呼失败", cause=cause)
+    assert error.cause == cause and error.reason == reason
+    assert DialFailed("外呼超时", reason="timeout").reason == "timeout"

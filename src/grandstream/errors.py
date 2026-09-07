@@ -20,7 +20,12 @@ class CallClosed(GrandstreamError):
 
 
 class DialFailed(GrandstreamError):
-    pass
+    """Structured outbound failure; cause is the Asterisk hangup cause, if supplied."""
+
+    def __init__(self, message: str, *, reason: str | None = None, cause: int | None = None):
+        self.cause = cause
+        self.reason = reason or {17: "busy", 18: "no_answer", 19: "no_answer"}.get(cause, "failed")
+        super().__init__(message)
 
 
 class MediaError(GrandstreamError):
