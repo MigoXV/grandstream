@@ -1,17 +1,18 @@
 """通过独立 ARI 应用和两个媒体通道测试本机 Asterisk；不拨打 PSTN。"""
 
-import argparse
 import asyncio
 import json
 import uuid
 
 import numpy as np
+import typer
 
 from grandstream import AriApplication, AriClient, AriConfig, AudioFrame, AudioStream
 
+app = typer.Typer(help=__doc__, pretty_exceptions_enable=False)
 
-async def main(media_sample_rate=8000, receive_sample_rate=None):
-    config = AriConfig.from_env()
+
+async def run(config: AriConfig, media_sample_rate: int, receive_sample_rate: int | None):
     name = "grandstream-smoke-" + uuid.uuid4().hex[:12]
     application = AriApplication(name, ari=config, media_sample_rate=media_sample_rate)
     answered = asyncio.Event()
@@ -118,9 +119,18 @@ async def main(media_sample_rate=8000, receive_sample_rate=None):
                 assert all(bridge["id"] not in bridges for bridge in remaining_bridges)
 
 
+@app.command()
+def main(
+    media_sample_rate: int = typer.Option(8000, min=1, help="应用媒体采样率"),
+    receive_sample_rate: int | None = typer.Option(None, min=1, help="接收端重采样率"),
+    ari_url: str = typer.Option("http://127.0.0.1:8088/ari", help="ARI REST 地址"),
+    ari_username: str = typer.Option("grandstream", help="ARI 用户名"),
+    ari_password: str = typer.Option(..., prompt=True, hide_input=True, help="ARI 密码；未传时隐藏输入"),
+    media_url: str | None = typer.Option(None, help="独立媒体服务地址，默认由 ARI 地址推导"),
+):
+    config = AriConfig(url=ari_url, username=ari_username, password=ari_password, media_url=media_url)
+    asyncio.run(run(config, media_sample_rate, receive_sample_rate))
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--media-sample-rate", type=int, default=8000)
-    parser.add_argument("--receive-sample-rate", type=int)
-    args = parser.parse_args()
-    asyncio.run(main(args.media_sample_rate, args.receive_sample_rate))
+    app()

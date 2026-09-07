@@ -112,7 +112,48 @@ async def tts_frames(chunks):
 # await call.audio.play(tts_frames(tts_chunks))
 ```
 
-`WavSource(path)` 按 WAV 元数据读入单声道 PCM16；`WavSink(path)` 使用首帧采样率写出 WAV，磁盘 I/O 放在工作线程。完整示例见 `examples/record_call.py` 和 `examples/outbound_wav.py`。
+`WavSource(path)` 按 WAV 元数据读入单声道 PCM16；`WavSink(path)` 使用首帧采样率写出 WAV，磁盘 I/O 放在工作线程。完整示例见 `examples/record_call/app.py` 和 `examples/outbound_wav/app.py`。
+
+## 应用集成（0.2.0）
+
+`AriApplication.start(wait_connected=False)` 启动后台连接任务后立即返回，适用于需要在 Asterisk 离线时仍提供管理页面的应用。默认 `start()` 仍等待首次连接并遵循超时；后台模式首次失败后也会退避重试。`connected` 和 `error` 提供当前状态，重连成功清除错误，`ApplicationReplaced` 仍会停止订阅。
+
+```python
+@app.connection_changed
+def connection_changed(connected, error):
+    # 更新健康状态或通知浏览器；error 不包含连接凭据。
+    pass
+
+@app.caller_changed
+def caller_changed(call):
+    # SDK 已更新同一个 Call，业务可用 call.id 定位会话。
+    save_caller(call.id, call.caller)
+
+await app.start(wait_connected=False)
+# 应用退出时 await app.close()
+```
+
+两个状态回调均为同步、非阻塞通知；只更新状态或入队。通知异常被记录，不中断其他通知或通话处理。
+
+### 接收静默与播放归档
+
+```python
+async for frame in call.audio.receive(sample_rate=16000, silence_timeout=0.1):
+    enqueue_asr(frame.pcm)
+
+def played(frame, acknowledged_at):
+    enqueue_recording(frame, acknowledged_at)
+
+await call.audio.play(tts_frames(), on_played=played)
+```
+
+- `silence_timeout` 默认为 `None`，保持不补静音；显式设置正数后，在没有音频的间隔补对应时长的静音，统一通过同一个重采样流转换。流控与播放确认消息不会重置音频时钟；关闭后停止补音。
+- `on_played(frame, acknowledged_at)` 是可选的同步回调。`frame` 为该次 `play()` 输入的**源采样率 PCM**，按已确认媒体时长分段；`acknowledged_at` 使用 `time.monotonic()`，可与会话起始时间对齐。
+- SDK 保存有限窗口内的源音频映射，排除媒体末帧补零；重采样舍入留下的源音频尾部在最终确认后交付。未产生任何媒体采样的极短输入不会产生确认。
+- `clear()` 丢弃未确认片段，旧标记不会触发后续播放的回调；`drain()` 完成前已交付确认。回调只应入队，不执行磁盘 I/O、阻塞操作或媒体控制；回调失败以 `MediaError` 结束媒体流。
+- 带确认回调的 `play()` 必须从已 drain/clear 的输出流开始。确认表示 Asterisk 处理了播放标记，不证明远端听筒播放。
+
+会话数据库、VAD、ASR/LLM/TTS、双轨时间对齐与分段归档由应用负责；SDK 不依赖这些业务模块。
 
 ## HT813 与通话设备信息
 
@@ -210,12 +251,14 @@ poetry run grandstream provision serve \
 
 生成器不读取或修改 `/etc/asterisk`。合并时将 endpoint/context 片段 include 到现有配置，HTTP/ARI 的 `[general]` 参数合并到已有节；需要 reload/restart 的项目由部署方处理。密码包含 Asterisk 配置语法的换行、分号、方括号、反斜杠时生成器会明确拒绝，XML 本身允许的转义字符不受此限制。
 
-`examples/provision_ht813.py` 演示完整生成，使用环境变量：
+[配置生成示例](examples/provision_ht813/README.md) 演示完整生成，通过命令行传入参数：
 
-```text
-HT813_MAC / HT813_IP / ASTERISK_LAN_IP
-HT813_FXS_PASSWORD / HT813_FXO_PASSWORD / GRANDSTREAM_ARI_PASSWORD
+```bash
+poetry run python examples/provision_ht813/app.py \
+  --mac 000b82abcdef --address 192.168.1.50 --server 192.168.1.25
 ```
+
+密码未通过参数传入时，会提示隐藏输入。每个 demo 都有独立目录、入口和说明，不读取环境变量；录音、外呼和回声示例通过 --ari-url、--ari-username、--ari-password 指定 ARI 连接。
 
 输出目录为 `outputs/provisioning` 和 `outputs/asterisk`，均忽略于 Git。示例选择两次响铃给来电显示采集留出时间；实际响铃次数、来显制式、断线检测和回声参数应按线路调整。
 
@@ -229,8 +272,8 @@ poetry check
 poetry build
 
 # 真实 Asterisk 的模拟回声测试：独立应用名，不拨打 PSTN，不修改 dialplan
-poetry run python examples/smoke_asterisk.py
-poetry run python examples/smoke_asterisk.py --media-sample-rate 16000 --receive-sample-rate 24000
+poetry run python examples/smoke_asterisk/app.py --ari-url http://127.0.0.1:8088/ari
+poetry run python examples/smoke_asterisk/app.py --media-sample-rate 16000 --receive-sample-rate 24000
 ```
 
 自动测试涵盖配置隔离与转义、SIP 双端口识别、PCM/WAV、重采样尾部、流控、播放打断、迟到事件、来电/外呼竞态、忙线/超时、媒体初始化失败和断线清理。模拟回声脚本会创建并清理自己的 ARI 资源，输出收到的音频字节数。
@@ -252,3 +295,8 @@ src/grandstream/
 ```
 
 后续型号应扩展设备能力与参数映射，ARI 和音频核心保持独立。旧版 RTP 后端、自动 resync、麦克风/扬声器及 ASR/TTS 服务适配不在首版范围。
+
+
+## 0.3.0 外呼失败信息
+
+`DialFailed.reason` 为 `busy`、`no_answer`、`timeout` 或 `failed`；`cause` 保留 Asterisk 提供的挂机原因整数，未提供时为 `None`。业务无需解析异常文本。PSTN 线路可能先建立 SIP 再拨号，因此这些结果仅反映 SDK 收到的信令，不能推断真人已接听。

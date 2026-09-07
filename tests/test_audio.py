@@ -219,3 +219,104 @@ async def test_invalid_handshake(hello):
             await stream.connect(socket)
     finally:
         await stream.close()
+
+
+@pytest.mark.parametrize("rate", [8000, 16000, 24000, 44100, 11025])
+@pytest.mark.parametrize("seconds", [0.137, 0.02005])
+async def test_play_receipts_preserve_source_and_exclude_padding(rate, seconds):
+    stream, socket = AudioStream(), Socket(rate=8000)
+    await stream.connect(socket)
+    pcm = signal(rate, seconds)
+    receipts = []
+
+    async def source():
+        for offset in range(0, len(pcm), 94):
+            yield AudioFrame(pcm[offset : offset + 94], rate)
+
+    try:
+        await stream.play(source(), on_played=lambda frame, at: receipts.append((frame, at)))
+        assert b"".join(f.pcm for f, _ in receipts) == pcm
+        assert all(f.sample_rate == rate for f, _ in receipts)
+        assert all(a <= b for (_, a), (_, b) in zip(receipts, receipts[1:]))
+        sent = b"".join(x for x in socket.sent if isinstance(x, bytes))
+        assert len(sent) % 320 == 0
+        assert len(sent) >= round(len(pcm) / 2 * 8000 / rate) * 2
+        assert not stream._source_pcm
+    finally:
+        await stream.close()
+
+
+async def test_receipts_after_clear_never_reach_old_or_new_callback():
+    stream, socket = AudioStream(), Socket(rate=8000, ack=False)
+    await stream.connect(socket)
+    receipts = []
+
+    async def source(value):
+        yield AudioFrame(bytes([value, 0]) * 160, 8000)
+
+    try:
+        old_player = asyncio.create_task(
+            stream.play(source(1), on_played=lambda *args: receipts.append(args))
+        )
+        await eventually(lambda: stream._marks)
+        old = next(iter(stream._marks))
+        await stream.clear()
+        with pytest.raises((asyncio.CancelledError, PlaybackInterrupted)):
+            await old_player
+        player = asyncio.create_task(stream.play(source(2), on_played=lambda *args: receipts.append(args)))
+        await eventually(lambda: stream._marks)
+        new = next(iter(stream._marks))
+        socket.queue.put_nowait(json.dumps({"event": "MEDIA_MARK_PROCESSED", "correlation_id": old}))
+        await asyncio.sleep(0.01)
+        assert not receipts and not player.done()
+        socket.queue.put_nowait(json.dumps({"event": "MEDIA_MARK_PROCESSED", "correlation_id": new}))
+        await player
+        assert len(receipts) == 1 and receipts[0][0].pcm == b"\x02\x00" * 160
+    finally:
+        await stream.close()
+
+
+@pytest.mark.parametrize("controls", [False, True])
+async def test_silence_filling_ignores_control_traffic_and_stops_on_close(controls):
+    stream, socket = AudioStream(), Socket(rate=8000)
+    await stream.connect(socket)
+
+    async def control_traffic():
+        while True:
+            if controls:
+                socket.queue.put_nowait(
+                    json.dumps({"event": "MEDIA_MARK_PROCESSED", "correlation_id": "old"})
+                )
+            await asyncio.sleep(0.005)
+
+    traffic = asyncio.create_task(control_traffic())
+    iterator = stream.receive(16000, silence_timeout=0.02)
+    try:
+        frame = await asyncio.wait_for(anext(iterator), 1)
+        assert frame.sample_rate == 16000 and frame.pcm
+        assert np.max(np.abs(np.frombuffer(frame.pcm, dtype="<i2"))) <= 1
+        await stream.close()
+        remaining = [f async for f in iterator]
+        assert sum(len(f.pcm) for f in remaining) < 16000
+    finally:
+        traffic.cancel()
+        await asyncio.gather(traffic, return_exceptions=True)
+        await iterator.aclose()
+        await stream.close()
+
+
+async def test_receipt_callback_failure_closes_media():
+    stream, socket = AudioStream(), Socket(rate=8000)
+    await stream.connect(socket)
+
+    async def source():
+        yield AudioFrame(bytes(320), 8000)
+
+    def fail(*args):
+        raise RuntimeError("private callback detail")
+
+    try:
+        with pytest.raises(MediaError, match="播放确认回调失败"):
+            await stream.play(source(), on_played=fail)
+    finally:
+        await stream.close()

@@ -139,7 +139,7 @@ class Call:
                 (entered, ended), timeout=timeout, return_when=asyncio.FIRST_COMPLETED
             )
             if not done:
-                raise DialFailed("外呼超时")
+                raise DialFailed("外呼超时", reason="timeout")
             if self.closed:
                 raise self.error or DialFailed("外呼未接通")
         finally:

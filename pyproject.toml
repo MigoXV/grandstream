@@ -1,6 +1,6 @@
 [project]
 name = "grandstream"
-version = "0.1.0"
+version = "0.3.0"
 description = "HT813 provisioning、Asterisk ARI 与异步双向 PCM 语音流 SDK"
 authors = [
     {name = "Grandstream SDK Maintainers",email = "grandstream-sdk@example.com"}
@@ -15,14 +15,14 @@ dependencies = [
 [project.optional-dependencies]
 provisioning = ["starlette>=0.47,<1", "uvicorn>=0.34,<1"]
 
+[project.scripts]
+grandstream = "grandstream.commands.app:app"
+
 [dependency-groups]
 dev = ["pytest>=8,<9", "pytest-asyncio>=1,<2", "ruff>=0.11,<1"]
 
 [tool.poetry]
 packages = [{include = "grandstream", from = "src"}]
-
-[tool.poetry.scripts]
-grandstream = "grandstream.commands.app:app"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

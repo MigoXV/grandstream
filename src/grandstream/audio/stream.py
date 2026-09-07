@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import time
 from collections import deque
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Callable
 
 from grandstream.errors import AudioOverflow, CallClosed, MediaError, PlaybackInterrupted
 
 from .pcm import MEDIA_FORMATS, AudioFrame, Resampler, validate_rate
+
+PlaybackCallback = Callable[[AudioFrame, float], None]
 
 
 class AudioStream:
@@ -41,7 +45,10 @@ class AudioStream:
         self._receiving = False
         self._error: Exception | None = None
         self._xoff = False
-        self._marks: dict[str, None] = {}
+        self._marks: dict[str, tuple[AudioFrame, PlaybackCallback] | None] = {}
+        self._on_played: PlaybackCallback | None = None
+        self._source_pcm = bytearray()
+        self._source_rate = self._source_frames = self._wire_frames = 0
         self._sequence = 0
         self._generation = 0
         self._wire = bytearray()
@@ -119,7 +126,13 @@ class AudioStream:
                     elif kind == "MEDIA_XON":
                         self._xoff = False
                     elif kind == "MEDIA_MARK_PROCESSED":
-                        self._marks.pop(event.get("correlation_id"), None)
+                        receipt = self._marks.pop(event.get("correlation_id"), None)
+                        if receipt:
+                            frame, callback = receipt
+                            try:
+                                callback(frame, time.monotonic())
+                            except Exception:
+                                raise MediaError("播放确认回调失败") from None
                     elif kind == "ERROR":
                         raise MediaError("Asterisk 媒体控制错误")
                     self._changed.set()
@@ -129,12 +142,16 @@ class AudioStream:
         except Exception as exc:
             self._finish(exc if isinstance(exc, MediaError) else MediaError("媒体连接或协议错误"))
 
-    async def receive(self, sample_rate: int | None = None):
+    async def receive(self, sample_rate: int | None = None, *, silence_timeout: float | None = None):
+        """Receive PCM; optionally fill audio-only idle intervals with digital silence."""
+        if silence_timeout is not None and (not math.isfinite(silence_timeout) or silence_timeout <= 0):
+            raise ValueError("补静音间隔必须为有限正数")
         if self._receiving:
             raise MediaError("音频流只允许一个接收者")
         target = self.sample_rate if sample_rate is None else validate_rate(sample_rate)
         resampler = Resampler(self.sample_rate, target)
         self._receiving = True
+        last_audio = time.monotonic()
         try:
             while True:
                 if self._error:
@@ -142,6 +159,7 @@ class AudioStream:
                 if self._input:
                     raw = self._input.popleft()
                     self._input_bytes -= len(raw)
+                    last_audio = time.monotonic()
                     data = resampler.feed(raw)
                     if data:
                         yield AudioFrame(data, target)
@@ -149,7 +167,21 @@ class AudioStream:
                     break
                 else:
                     self._input_changed.clear()
-                    await self._input_changed.wait()
+                    try:
+                        remaining = (
+                            None
+                            if silence_timeout is None
+                            else max(0, silence_timeout - (time.monotonic() - last_audio))
+                        )
+                        await asyncio.wait_for(self._input_changed.wait(), remaining)
+                    except asyncio.TimeoutError:
+                        if self._input or self._closed.is_set():
+                            continue
+                        last_audio = time.monotonic()
+                        raw = bytes(max(1, round(self.sample_rate * silence_timeout)) * 2)
+                        data = resampler.feed(raw)
+                        if data:
+                            yield AudioFrame(data, target)
             tail = resampler.feed(b"", last=True)
             if tail:
                 yield AudioFrame(tail, target)
@@ -194,7 +226,17 @@ class AudioStream:
                 del self._wire[: self._frame_size]
                 self._sequence += 1
                 mark = f"{generation}-{self._sequence}"
-                self._marks[mark] = None
+                receipt = None
+                if self._on_played:
+                    self._wire_frames += len(payload) // 2
+                    end = self._wire_frames * self._source_rate // self.sample_rate
+                    count = min(end - self._source_frames, len(self._source_pcm) // 2)
+                    original = bytes(self._source_pcm[: count * 2])
+                    del self._source_pcm[: count * 2]
+                    self._source_frames += count
+                    if original:
+                        receipt = (AudioFrame(original, self._source_rate), self._on_played)
+                self._marks[mark] = receipt
                 await self._send(payload)
                 await self._send(json.dumps({"command": "MARK_MEDIA", "correlation_id": mark}))
 
@@ -206,13 +248,17 @@ class AudioStream:
             self._check(generation)
             if self._resampler is None:
                 self._resampler = Resampler(frame.sample_rate, self.sample_rate)
+                self._source_rate = frame.sample_rate
             if self._resampler.source != frame.sample_rate:
                 raise ValueError("连续输出流不能改变采样率；请先 drain() 或 clear()")
             # Even a large caller-owned chunk is converted and queued in bounded slices.
             size = max(2, frame.sample_rate // 50 * 2)
             for offset in range(0, len(frame.pcm), size):
                 self._check(generation)
-                self._wire.extend(self._resampler.feed(frame.pcm[offset : offset + size]))
+                part = frame.pcm[offset : offset + size]
+                if self._on_played:
+                    self._source_pcm.extend(part)
+                self._wire.extend(self._resampler.feed(part))
                 await self._send_frames(generation)
 
     async def drain(self):
@@ -228,12 +274,33 @@ class AudioStream:
                 self._wire.extend(bytes((-len(self._wire)) % self._frame_size))
                 await self._send_frames(generation)
             await self._wait(lambda: not self._marks, generation)
+            # A resampler may round down the last output sample. The remaining
+            # source fraction belongs to the final confirmed frame, not the next play.
+            if self._on_played and self._source_pcm and self._wire_frames:
+                frame = AudioFrame(bytes(self._source_pcm), self._source_rate)
+                self._source_pcm.clear()
+                try:
+                    self._on_played(frame, time.monotonic())
+                except Exception:
+                    error = MediaError("播放确认回调失败")
+                    self._finish(error)
+                    raise error from None
 
-    async def play(self, source: AsyncIterable[AudioFrame]):
+    async def play(self, source: AsyncIterable[AudioFrame], *, on_played: PlaybackCallback | None = None):
+        """Play frames; on_played(source_frame, monotonic_time) runs synchronously on ACK.
+
+        Callbacks must only enqueue work, not block or perform media operations.
+        Padding is excluded. clear() discards unacknowledged source audio.
+        """
         if self._play_task is not None:
             raise MediaError("已有播放任务；先 clear() 再开始下一次播放")
         self._check()
+        if on_played and (self._resampler is not None or self._wire or self._marks):
+            raise MediaError("带播放确认的 play() 需要先 drain() 或 clear()")
         iterator = aiter(source)
+        self._on_played = on_played
+        self._source_pcm.clear()
+        self._source_frames = self._wire_frames = 0
         self._play_task = asyncio.current_task()
         generation = self._generation
         try:
@@ -251,6 +318,8 @@ class AudioStream:
                     await iterator.aclose()
             finally:
                 self._play_task = None
+                self._on_played = None
+                self._source_pcm.clear()
 
     async def clear(self):
         task = self._play_task
@@ -259,6 +328,7 @@ class AudioStream:
             self._wire.clear()
             self._resampler = None
             self._marks.clear()
+            self._source_pcm.clear()
             self._xoff = False
             self._changed.set()
             if self._socket and not self._closed.is_set():
@@ -284,5 +354,6 @@ class AudioStream:
         if self._socket:
             await self._socket.close()
         self._marks.clear()
+        self._source_pcm.clear()
         self._wire.clear()
         self._resampler = None
